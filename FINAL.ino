@@ -5,6 +5,8 @@
 #include <LiquidCrystal_I2C.h>
 #include <Keypad.h>
 #include <EEPROM.h>
+#include <SHA256.h>
+#include <RTClib.h>
 
 // ==========================================
 // CONFIGURATION & FLAGS
@@ -30,6 +32,9 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 // Initialize I2C LCD (Operator Facing)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Initialize RTC (Real-Time Clock)
+RTC_DS3231 rtc;
 
 // Keypad Configuration
 const byte ROWS = 4;
@@ -66,7 +71,9 @@ enum OpState {
   OP_DELETE_PASSWORD,
   OP_CHANGE_OLD_PASSWORD,
   OP_CHANGE_NEW_PASSWORD_1,
-  OP_CHANGE_NEW_PASSWORD_2
+  OP_CHANGE_NEW_PASSWORD_2,
+  OP_FORCE_OPEN_PASSWORD,
+  OP_VIEW_PASSWORD
 };
 OpState opState = OP_IDLE;
 
@@ -79,13 +86,16 @@ int currentViewIndex = 0;
 unsigned long lcdMessageTimer = 0;
 bool showingMessage = false;
 
+// Remote Serial Authentication Variables
+String activeChallenge = "";
+String serialInputBuffer = "";
+
 // ==========================================
 // 7-SEGMENT DISPLAY MULTIPLEXING (TIMER1)
 // ==========================================
 volatile byte displayChars[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 volatile int currentDigit = 0;
 
-// Character Segment Encoding for Common Anode (~0bGFEDCBA)
 const byte SEG_S = ~0b01101101;
 const byte SEG_T = ~0b01111000;
 const byte SEG_O = ~0b00111111;
@@ -95,34 +105,27 @@ const byte SEG_N = ~0b00110111;
 const byte SEG_BLANK = ~0b00000000;
 
 void setupTimer1() {
-  cli(); // stop interrupts
+  cli(); 
   TCCR1A = 0; 
   TCCR1B = 0; 
-  // Set compare match register for 2ms interval (500Hz multiplexing rate)
-  // 16MHz / (64 * 500) - 1 = 499
-  OCR1A = 499; 
-  TCCR1B |= (1 << WGM12); // turn on CTC mode
-  TCCR1B |= (1 << CS11) | (1 << CS10); // set prescaler to 64
-  TIMSK1 |= (1 << OCIE1A); // enable timer compare interrupt
-  sei(); // allow interrupts
+  OCR1A = 499; // 500Hz multiplexing rate
+  TCCR1B |= (1 << WGM12); 
+  TCCR1B |= (1 << CS11) | (1 << CS10); 
+  TIMSK1 |= (1 << OCIE1A); 
+  sei(); 
 }
 
-// Timer1 Interrupt Service Routine for multiplexing digits
 ISR(TIMER1_COMPA_vect) {
-  // Turn off all digits (Common Anode: LOW = Off)
   digitalWrite(A8, LOW);
   digitalWrite(A9, LOW);
   digitalWrite(A10, LOW);
   digitalWrite(A11, LOW);
 
-  // Send segment pattern via 74HC595 shift register
   digitalWrite(latchPin, LOW);
   shiftOut(dataPin, clockPin, MSBFIRST, displayChars[currentDigit]);
   digitalWrite(latchPin, HIGH);
 
-  // Turn on current digit (Common Anode: HIGH = On)
   digitalWrite(digitPins[currentDigit], HIGH);
-
   currentDigit = (currentDigit + 1) % 4;
 }
 
@@ -148,19 +151,45 @@ byte getSegmentCode(char c) {
 }
 
 // ==========================================
+// TIMESTAMP FORMATTING HELPER
+// ==========================================
+String getTimestampStr() {
+  DateTime now = rtc.now();
+  char buf[25];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          now.year(), now.month(), now.day(),
+          now.hour(), now.minute(), now.second());
+  return String(buf);
+}
+
+void logMessage(String msg) {
+  Serial.print("LOG: [");
+  Serial.print(getTimestampStr());
+  Serial.print("] ");
+  Serial.println(msg);
+}
+
+// ==========================================
 // SETUP & MAIN LOOP
 // ==========================================
 void setup() {
   Serial.begin(9600);
+  randomSeed(analogRead(0));
   
   SPI.begin();          
   mfrc522.PCD_Init();   
   
-  // Initialize LCD
   lcd.init();                      
   lcd.backlight();
 
-  // Initialize 7-Segment Pins
+  if (!rtc.begin()) {
+    Serial.println("LOG: Couldn't find RTC!");
+  }
+  if (rtc.lostPower()) {
+    Serial.println("LOG: RTC lost power, setting default time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
   pinMode(latchPin, OUTPUT);
   pinMode(dataPin, OUTPUT);
   pinMode(clockPin, OUTPUT);
@@ -169,12 +198,9 @@ void setup() {
   pinMode(A10, OUTPUT);
   pinMode(A11, OUTPUT);
 
-  // Initialize Timer Interrupt for 7-Segment Display
   setupTimer1();
-  
-  myStepper.setSpeed(10); // Set motor speed in RPM
+  myStepper.setSpeed(10); 
 
-  // Initialize card count if uninitialized
   if (EEPROM.read(cardCountAddress) > maxCards) {
     EEPROM.write(cardCountAddress, 1);
     byte defaultUID[] = {0x3C, 0x79, 0x54, 0x83};
@@ -183,28 +209,55 @@ void setup() {
     }
   }
 
-  // Initialize or Reset Password based on flag
   byte currentPwdLen = EEPROM.read(pwdLenAddress);
   if (RESET_PASSWORD_FLAG || currentPwdLen == 255 || currentPwdLen > 8) {
     savePassword("1234");
-    Serial.println("LOG: Admin password initialized/reset to '1234'.");
+    logMessage("Admin password initialized/reset to '1234'.");
   }
   
-  setDisplayWord('S', 'T', 'O', 'P'); // Default status
+  setDisplayWord('S', 'T', 'O', 'P'); 
   updateOperatorLCD();
-  Serial.println("System Initialized. Gate Controller Ready.");
+  logMessage("System Initialized. Gate Controller Ready.");
 }
 
 void loop() {
-  // 1. RFID Scanner check runs every loop
   handleRFIDScanner();
-
-  // 2. Operator keypad & LCD interface runs concurrently
   handleOperatorUI();
+  handleSerialCommand();
+}
+
+String uidToString(byte *buffer, byte bufferSize) {
+  String uidStr = "";
+  for (byte i = 0; i < bufferSize; i++) {
+    if (buffer[i] < 0x10) uidStr += "0";
+    uidStr += String(buffer[i], HEX);
+    if (i < bufferSize - 1) uidStr += " ";
+  }
+  uidStr.toUpperCase();
+  return uidStr;
+}
+
+void executeGateOpenSequence(String source, String uidInfo = "") {
+  logMessage("Gate opening triggered via " + source + (uidInfo != "" ? " | UID: " + uidInfo : ""));
+  showTemporaryMessage("Gate Opening", source);
+  setDisplayWord('O', 'P', 'E', 'N');
+
+  myStepper.step(targetSteps);
+  logMessage("Gate is fully OPEN.");
+  
+  delay(gateHoldOpenTime); 
+  
+  logMessage("Closing gate...");
+  myStepper.step(-targetSteps);
+  logMessage("Gate is fully CLOSED.");
+
+  setDisplayWord('S', 'T', 'O', 'P');
 }
 
 void handleRFIDScanner() {
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    String scannedUID = uidToString(mfrc522.uid.uidByte, mfrc522.uid.size);
+    
     if (opState == OP_REG_SCAN_CARD) {
       byte count = EEPROM.read(cardCountAddress);
       if (count < maxCards) {
@@ -214,36 +267,20 @@ void handleRFIDScanner() {
         }
         count++;
         EEPROM.write(cardCountAddress, count);
-        Serial.println("LOG: New RFID card registered and saved to EEPROM.");
-        showTemporaryMessage("Card Added!", "Total Cards: " + String(count));
+        logMessage("New RFID card registered and saved to EEPROM | UID: " + scannedUID);
+        showTemporaryMessage("Card Added!", "Total: " + String(count));
       } else {
+        logMessage("Card registration failed: Storage full | Attempted UID: " + scannedUID);
         showTemporaryMessage("Storage Full!", "Max 16 Cards");
       }
       opState = OP_IDLE;
     } 
     else {
       if (checkCardUID()) {
-        Serial.println("LOG: Access Granted. Valid RFID card detected.");
-        showTemporaryMessage("Access Granted", "Opening Gate...");
-        
-        // Switch display to OPEN
-        setDisplayWord('O', 'P', 'E', 'N');
-
-        // Blocking gate operation sequence (7-segment continues refreshing via ISR)
-        Serial.println("LOG: Gate is opening (90 degrees)...");
-        myStepper.step(targetSteps);
-        Serial.println("LOG: Gate is fully OPEN.");
-        
-        delay(gateHoldOpenTime); 
-        
-        Serial.println("LOG: Closing gate...");
-        myStepper.step(-targetSteps);
-        Serial.println("LOG: Gate is fully CLOSED.");
-
-        // Switch display back to STOP
-        setDisplayWord('S', 'T', 'O', 'P');
+        logMessage("Access Granted | Valid RFID card detected | UID: " + scannedUID);
+        executeGateOpenSequence("RFID Card", scannedUID);
       } else {
-        Serial.println("LOG: Access Denied. Unknown RFID card scanned.");
+        logMessage("Access Denied | Unknown RFID card scanned | UID: " + scannedUID);
         showTemporaryMessage("Access Denied", "Unknown Card");
       }
     }
@@ -274,23 +311,56 @@ void handleOperatorUI() {
         lcd.setCursor(0, 1);
         lcd.print("_[+]Confirm");
       } else if (customKey == 'C') {
-        currentViewIndex = 0;
-        opState = OP_VIEW_CARDS;
-        updateOperatorLCD();
-      } else if (customKey == 'D') {
         enteredPassword = "";
-        opState = OP_CHANGE_OLD_PASSWORD;
+        opState = OP_VIEW_PASSWORD;
         lcd.clear();
         lcd.setCursor(0, 0);
-        lcd.print("Old Password:");
+        lcd.print("View Cards Pwd:");
         lcd.setCursor(0, 1);
         lcd.print("_[+]Confirm");
+      } else if (customKey == 'D') {
+        enteredPassword = "";
+        opState = OP_FORCE_OPEN_PASSWORD;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Override Password:");
+        lcd.setCursor(0, 1);
+        lcd.print("_[+]Confirm");
+      }
+      break;
+
+    case OP_VIEW_PASSWORD:
+      if (customKey == '-') {
+        logMessage("Card list view operation cancelled during password entry.");
+        showTemporaryMessage("Operation", "Cancelled");
+        opState = OP_IDLE;
+      } else if (customKey == '+') {
+        if (enteredPassword == getStoredPassword()) {
+          logMessage("Admin password verified for card list viewing.");
+          currentViewIndex = 0;
+          opState = OP_VIEW_CARDS;
+          updateOperatorLCD();
+        } else {
+          logMessage("Incorrect password entered for card list viewing.");
+          showTemporaryMessage("Wrong Password", "Access Denied");
+          opState = OP_IDLE;
+        }
+      } else if (customKey >= '0' && customKey <= '9') {
+        if (enteredPassword.length() < 8) {
+          enteredPassword += customKey;
+          lcd.setCursor(0, 1);
+          for (int i = 0; i < enteredPassword.length(); i++) {
+            lcd.print("*");
+          }
+          lcd.print("[+]Confirm");
+        }
       }
       break;
 
     case OP_VIEW_CARDS:
       if (customKey == 'C') {
         opState = OP_IDLE;
+        logMessage("Operator exited card list view.");
         updateOperatorLCD();
       } else if (customKey == 'A') {
         byte count = EEPROM.read(cardCountAddress);
@@ -318,18 +388,46 @@ void handleOperatorUI() {
       }
       break;
 
-    case OP_REG_PASSWORD:
+    case OP_FORCE_OPEN_PASSWORD:
       if (customKey == '-') {
-        Serial.println("LOG: Registration password entry cancelled.");
+        logMessage("Gate override operation cancelled by operator.");
         showTemporaryMessage("Operation", "Cancelled");
         opState = OP_IDLE;
       } else if (customKey == '+') {
         if (enteredPassword == getStoredPassword()) {
-          Serial.println("LOG: Admin password verified for registration.");
+          logMessage("Admin password verified for physical gate override.");
+          opState = OP_IDLE;
+          executeGateOpenSequence("Physical Keypad Override");
+          updateOperatorLCD();
+        } else {
+          logMessage("Incorrect admin password entered for physical gate override.");
+          showTemporaryMessage("Wrong Password", "Access Denied");
+          opState = OP_IDLE;
+        }
+      } else if (customKey >= '0' && customKey <= '9') {
+        if (enteredPassword.length() < 8) {
+          enteredPassword += customKey;
+          lcd.setCursor(0, 1);
+          for (int i = 0; i < enteredPassword.length(); i++) {
+            lcd.print("*");
+          }
+          lcd.print("[+]Confirm");
+        }
+      }
+      break;
+
+    case OP_REG_PASSWORD:
+      if (customKey == '-') {
+        logMessage("Card registration operation cancelled during password entry.");
+        showTemporaryMessage("Operation", "Cancelled");
+        opState = OP_IDLE;
+      } else if (customKey == '+') {
+        if (enteredPassword == getStoredPassword()) {
+          logMessage("Admin password verified for card registration.");
           showTemporaryMessage("Pass Correct!", "Scan New Card");
           opState = OP_REG_SCAN_CARD;
         } else {
-          Serial.println("LOG: Incorrect admin password entered.");
+          logMessage("Incorrect admin password entered for card registration.");
           showTemporaryMessage("Wrong Password", "Access Denied");
           opState = OP_IDLE;
         }
@@ -347,7 +445,7 @@ void handleOperatorUI() {
 
     case OP_REG_SCAN_CARD:
       if (customKey == '-') {
-        Serial.println("LOG: Card scan registration cancelled.");
+        logMessage("Card scan registration cancelled by operator.");
         showTemporaryMessage("Operation", "Cancelled");
         opState = OP_IDLE;
       }
@@ -355,13 +453,20 @@ void handleOperatorUI() {
 
     case OP_DELETE_PASSWORD:
       if (customKey == '-') {
-        Serial.println("LOG: Card deletion password entry cancelled.");
+        logMessage("Card deletion operation cancelled during password entry.");
         showTemporaryMessage("Operation", "Cancelled");
         opState = OP_VIEW_CARDS;
         updateOperatorLCD();
       } else if (customKey == '+') {
         if (enteredPassword == getStoredPassword()) {
           byte count = EEPROM.read(cardCountAddress);
+          int baseAddr = cardListStartAddress + (currentViewIndex * uidSize);
+          byte deletedUIDBytes[4];
+          for (byte b = 0; b < uidSize; b++) {
+            deletedUIDBytes[b] = EEPROM.read(baseAddr + b);
+          }
+          String deletedUID = uidToString(deletedUIDBytes, uidSize);
+
           for (int i = currentViewIndex; i < count - 1; i++) {
             for (int b = 0; b < uidSize; b++) {
               byte nextByte = EEPROM.read(cardListStartAddress + (i + 1) * uidSize + b);
@@ -370,106 +475,16 @@ void handleOperatorUI() {
           }
           count--;
           EEPROM.write(cardCountAddress, count);
-          Serial.println("LOG: Card successfully deleted from EEPROM.");
+          logMessage("Card successfully deleted from EEPROM | Index: " + String(currentViewIndex) + " | UID: " + deletedUID);
           showTemporaryMessage("Card Deleted!", "");
           currentViewIndex = 0;
           opState = OP_VIEW_CARDS;
           updateOperatorLCD();
         } else {
-          Serial.println("LOG: Incorrect password for card deletion.");
+          logMessage("Incorrect password entered for card deletion.");
           showTemporaryMessage("Wrong Password", "Access Denied");
           opState = OP_VIEW_CARDS;
           updateOperatorLCD();
-        }
-      } else if (customKey >= '0' && customKey <= '9') {
-        if (enteredPassword.length() < 8) {
-          enteredPassword += customKey;
-          lcd.setCursor(0, 1);
-          for (int i = 0; i < enteredPassword.length(); i++) {
-            lcd.print("*");
-          }
-          lcd.print("[+]Confirm");
-        }
-      }
-      break;
-
-    case OP_CHANGE_OLD_PASSWORD:
-      if (customKey == '-') {
-        Serial.println("LOG: Password change cancelled.");
-        showTemporaryMessage("Operation", "Cancelled");
-        opState = OP_IDLE;
-      } else if (customKey == '+') {
-        if (enteredPassword == getStoredPassword()) {
-          enteredPassword = "";
-          opState = OP_CHANGE_NEW_PASSWORD_1;
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("New Password:");
-          lcd.setCursor(0, 1);
-          lcd.print("_[+]Confirm");
-        } else {
-          Serial.println("LOG: Incorrect old password entered.");
-          showTemporaryMessage("Wrong Password", "Access Denied");
-          opState = OP_IDLE;
-        }
-      } else if (customKey >= '0' && customKey <= '9') {
-        if (enteredPassword.length() < 8) {
-          enteredPassword += customKey;
-          lcd.setCursor(0, 1);
-          for (int i = 0; i < enteredPassword.length(); i++) {
-            lcd.print("*");
-          }
-          lcd.print("[+]Confirm");
-        }
-      }
-      break;
-
-    case OP_CHANGE_NEW_PASSWORD_1:
-      if (customKey == '-') {
-        Serial.println("LOG: Password change cancelled.");
-        showTemporaryMessage("Operation", "Cancelled");
-        opState = OP_IDLE;
-      } else if (customKey == '+') {
-        if (enteredPassword.length() > 0) {
-          newPasswordTemp = enteredPassword;
-          enteredPassword = "";
-          opState = OP_CHANGE_NEW_PASSWORD_2;
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("Confirm Password:");
-          lcd.setCursor(0, 1);
-          lcd.print("_[+]Confirm");
-        } else {
-          showTemporaryMessage("Invalid", "Empty Password");
-          opState = OP_IDLE;
-        }
-      } else if (customKey >= '0' && customKey <= '9') {
-        if (enteredPassword.length() < 8) {
-          enteredPassword += customKey;
-          lcd.setCursor(0, 1);
-          for (int i = 0; i < enteredPassword.length(); i++) {
-            lcd.print("*");
-          }
-          lcd.print("[+]Confirm");
-        }
-      }
-      break;
-
-    case OP_CHANGE_NEW_PASSWORD_2:
-      if (customKey == '-') {
-        Serial.println("LOG: Password change cancelled.");
-        showTemporaryMessage("Operation", "Cancelled");
-        opState = OP_IDLE;
-      } else if (customKey == '+') {
-        if (enteredPassword == newPasswordTemp) {
-          savePassword(enteredPassword);
-          Serial.println("LOG: Password successfully changed.");
-          showTemporaryMessage("Password Changed", "Successfully");
-          opState = OP_IDLE;
-        } else {
-          Serial.println("LOG: Passwords did not match.");
-          showTemporaryMessage("Mismatch", "Failed to Change");
-          opState = OP_IDLE;
         }
       } else if (customKey >= '0' && customKey <= '9') {
         if (enteredPassword.length() < 8) {
@@ -486,6 +501,216 @@ void handleOperatorUI() {
     default:
       break;
   }
+}
+
+// ==========================================
+// REMOTE SERIAL CHALLENGE-RESPONSE & COMMAND PARSER
+// ==========================================
+void handleSerialCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialInputBuffer.length() > 0) {
+        processCommand(serialInputBuffer);
+        serialInputBuffer = "";
+      }
+    } else {
+      serialInputBuffer += c;
+    }
+  }
+}
+
+void processCommand(String cmd) {
+  cmd.trim();
+  
+  if (cmd.equalsIgnoreCase("CHALLENGE")) {
+    long challengeNum = random(100000, 999999);
+    activeChallenge = String(challengeNum);
+
+    logMessage("Remote challenge requested. Generated challenge: " + activeChallenge);
+    Serial.print("CHALLENGE:");
+    Serial.println(activeChallenge);
+  } 
+  else if (cmd.startsWith("AUTH:")) {
+    int firstSpace = cmd.indexOf(' ');
+    if (firstSpace == -1) {
+      logMessage("Remote serial error: PARSING_ERROR");
+      Serial.println("ERROR:PARSING_ERROR");
+      return;
+    }
+
+    String authPart = cmd.substring(5, firstSpace);
+    String rest = cmd.substring(firstSpace + 1);
+    rest.trim();
+
+    int cmdSpace = rest.indexOf(' ');
+    String command = "";
+    String param = "";
+    if (cmdSpace == -1) {
+      command = rest;
+    } else {
+      command = rest.substring(0, cmdSpace);
+      param = rest.substring(cmdSpace + 1);
+      param.trim();
+    }
+    command.toLowerCase();
+
+    // 1. Check command validity FIRST before checking hash or consuming challenge
+    bool isValidCmd = (command.equals("list") || command.equals("add") || command.equals("delete") || command.equals("open"));
+    if (!isValidCmd) {
+      logMessage("Remote serial error: INVALID_COMMAND (" + command + ")");
+      Serial.println("ERROR:INVALID_COMMAND");
+      return;
+    }
+
+    // 2. Check active challenge
+    if (activeChallenge.length() == 0) {
+      logMessage("Remote serial error: INVALID_AUTH (No active challenge)");
+      Serial.println("ERROR:INVALID_AUTH");
+      return;
+    }
+
+    // 3. Compute expected hash using challenge + password + command + parameter
+    String storedPwd = getStoredPassword();
+    String combined = activeChallenge + storedPwd + command + param;
+
+    SHA256 sha256;
+    sha256.reset();
+    sha256.update(combined.c_str(), combined.length());
+    uint8_t hash[32];
+    sha256.finalize(hash, sizeof(hash));
+
+    String expectedHex = "";
+    for (int i = 0; i < 32; i++) {
+      char buf[3];
+      sprintf(buf, "%02x", hash[i]);
+      expectedHex += buf;
+    }
+
+    // 4. Verify hash
+    if (!authPart.equalsIgnoreCase(expectedHex)) {
+      logMessage("Remote serial error: INVALID_AUTH (Wrong hash provided)");
+      Serial.println("ERROR:INVALID_AUTH");
+      activeChallenge = ""; // Invalidate challenge on invalid attempt
+      return;
+    }
+
+    // 5. Invalidate challenge immediately (single-use)
+    activeChallenge = "";
+
+    // 6. Execute requested command
+    if (command.equals("list")) {
+      logMessage("Remote serial command executed: list");
+      serialExecuteList();
+    } 
+    else if (command.equals("add")) {
+      logMessage("Remote serial command executed: add with param " + param);
+      serialExecuteAdd(param);
+    } 
+    else if (command.equals("delete")) {
+      logMessage("Remote serial command executed: delete with param " + param);
+      serialExecuteDelete(param);
+    } 
+    else if (command.equals("open")) {
+      logMessage("Remote serial command executed: open");
+      Serial.println("SUCCESS:GATE_OPENING");
+      executeGateOpenSequence("Remote Serial Command");
+    }
+  } 
+  else {
+    logMessage("Remote serial error: PARSING_ERROR");
+    Serial.println("ERROR:PARSING_ERROR");
+  }
+}
+
+void serialExecuteList() {
+  byte count = EEPROM.read(cardCountAddress);
+  if (count == 0) {
+    Serial.println("CARDS:EMPTY");
+  } else {
+    Serial.print("CARDS:COUNT=");
+    Serial.println(count);
+    for (int c = 0; c < count; c++) {
+      Serial.print("INDEX ");
+      Serial.print(c);
+      Serial.print(": ");
+      int baseAddr = cardListStartAddress + (c * uidSize);
+      for (byte i = 0; i < uidSize; i++) {
+        byte val = EEPROM.read(baseAddr + i);
+        if (val < 0x10) Serial.print("0");
+        Serial.print(val, HEX);
+        if (i < uidSize - 1) Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+}
+
+void serialExecuteAdd(String param) {
+  param.replace(" ", "");
+  if (param.length() != 8) {
+    logMessage("Remote serial add error: PARSING_ERROR (Invalid UID length)");
+    Serial.println("ERROR:PARSING_ERROR");
+    return;
+  }
+
+  byte newUID[4];
+  for (int i = 0; i < 4; i++) {
+    String byteStr = param.substring(i * 2, i * 2 + 2);
+    newUID[i] = (byte)strtol(byteStr.c_str(), NULL, 16);
+  }
+
+  byte count = EEPROM.read(cardCountAddress);
+  if (count >= maxCards) {
+    logMessage("Remote serial add error: STORAGE_FULL");
+    Serial.println("ERROR:STORAGE_FULL");
+    return;
+  }
+
+  int writeAddress = cardListStartAddress + (count * uidSize);
+  for (byte i = 0; i < uidSize; i++) {
+    EEPROM.write(writeAddress + i, newUID[i]);
+  }
+  count++;
+  EEPROM.write(cardCountAddress, count);
+  
+  String addedUIDStr = uidToString(newUID, 4);
+  logMessage("Card added via remote serial | UID: " + addedUIDStr);
+  Serial.println("SUCCESS:CARD_ADDED");
+}
+
+void serialExecuteDelete(String param) {
+  if (param.length() == 0) {
+    logMessage("Remote serial delete error: PARSING_ERROR");
+    Serial.println("ERROR:PARSING_ERROR");
+    return;
+  }
+
+  int index = param.toInt();
+  byte count = EEPROM.read(cardCountAddress);
+  if (index < 0 || index >= count) {
+    logMessage("Remote serial delete error: INVALID_INDEX (" + String(index) + ")");
+    Serial.println("ERROR:INVALID_INDEX");
+    return;
+  }
+
+  int baseAddr = cardListStartAddress + (index * uidSize);
+  byte deletedUIDBytes[4];
+  for (byte b = 0; b < uidSize; b++) {
+    deletedUIDBytes[b] = EEPROM.read(baseAddr + b);
+  }
+  String deletedUID = uidToString(deletedUIDBytes, uidSize);
+
+  for (int i = index; i < count - 1; i++) {
+    for (int b = 0; b < uidSize; b++) {
+      byte nextByte = EEPROM.read(cardListStartAddress + (i + 1) * uidSize + b);
+      EEPROM.write(cardListStartAddress + i * uidSize + b, nextByte);
+    }
+  }
+  count--;
+  EEPROM.write(cardCountAddress, count);
+  logMessage("Card deleted via remote serial | Index: " + String(index) + " | UID: " + deletedUID);
+  Serial.println("SUCCESS:CARD_DELETED");
 }
 
 void savePassword(String pwd) {
@@ -540,7 +765,7 @@ void updateOperatorLCD() {
     lcd.setCursor(0, 0);
     lcd.print("[+]Reg [C]Lst"); 
     lcd.setCursor(0, 1);
-    lcd.print("[D]Pwd       "); 
+    lcd.print("[D]Opr [E]Pwd"); 
   } else if (opState == OP_VIEW_CARDS) {
     byte count = EEPROM.read(cardCountAddress);
     if (count == 0) {
